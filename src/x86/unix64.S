@@ -33,6 +33,10 @@
 #include "internal64.h"
 #include "asmnames.h"
 
+/* Note: To work in environments compiled with -mno-red-zone, these functions
+ * must not rely on the red zone; any data below the stack pointer may
+ * potentially get overwritten at any time. */
+
 	.text
 
 /* This macro allows the safe creation of jump tables without an
@@ -100,12 +104,12 @@ L(ret_from_load_sse):
 	/* Call the user function.  */
 	call	*%r11
 
-	/* Deallocate stack arg area; local stack frame in redzone.  */
-	leaq	24(%rbp), %rsp
-
+	/* Deallocate the stack arg area after reloading values from it */
+	leaq	24(%rbp), %r10
 	movq	0(%rbp), %rcx		/* Reload flags.  */
 	movq	8(%rbp), %rdi		/* Reload raddr.  */
 	movq	16(%rbp), %rbp		/* Reload old frame pointer.  */
+	movq	%r10, %rsp
 L(UW2):
 	/* cfi_remember_state */
 	/* cfi_def_cfa(%rsp, 8) */
@@ -118,54 +122,50 @@ L(UW2):
 	ja	L(sa)
 	leaq	(%r11, %r10, 8), %r10
 
-	/* Prep for the structure cases: scratch area in redzone.  */
-	leaq	-20(%rsp), %rsi
+	/* Prep for the structure cases: scratch area on stack.  */
+	subq	$20, %rsp
+	movq	%rsp, %rsi
 	jmp	*%r10
 
 	.balign	8
 L(store_table):
 E(L(store_table), UNIX64_RET_VOID)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_UINT8)
 	movzbl	%al, %eax
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_UINT16)
 	movzwl	%ax, %eax
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_UINT32)
 	movl	%eax, %eax
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_SINT8)
 	movsbq	%al, %rax
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_SINT16)
 	movswq	%ax, %rax
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_SINT32)
 	cltq
-	movq	%rax, (%rdi)
-	ret
+	jmp	L(s4)
 E(L(store_table), UNIX64_RET_INT64)
+L(s4):
 	movq	%rax, (%rdi)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_XMM32)
 	movd	%xmm0, (%rdi)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_XMM64)
 	movq	%xmm0, (%rdi)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_X87)
 	fstpt	(%rdi)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_X87_2)
 	fstpt	(%rdi)
 	fstpt	16(%rdi)
-	ret
+	jmp	L(s5)
 E(L(store_table), UNIX64_RET_ST_XMM0_RAX)
 	movq	%rax, 8(%rsi)
 	jmp	L(s3)
@@ -181,12 +181,14 @@ L(s2):
 	movq	%rax, (%rsi)
 	shrl	$UNIX64_SIZE_SHIFT, %ecx
 	rep movsb
-	ret
-	.balign 8
+	jmp	L(s5)
 L(s3):
 	movq	%xmm0, (%rsi)
 	shrl	$UNIX64_SIZE_SHIFT, %ecx
 	rep movsb
+L(s5):
+	/* Deallocate the struct scratch space */
+	addq	$20, %rsp
 	ret
 
 L(sa):	call	PLT(C(abort))
@@ -217,9 +219,6 @@ ENDF(C(ffi_call_unix64))
 #define ffi_closure_OFS_V	(6*8)
 #define ffi_closure_OFS_RVALUE	(ffi_closure_OFS_V + 8*16)
 #define ffi_closure_FS		(ffi_closure_OFS_RVALUE + 32 + 8)
-
-/* The location of rvalue within the red zone after deallocating the frame.  */
-#define ffi_closure_RED_RVALUE	(ffi_closure_OFS_RVALUE - ffi_closure_FS)
 
 	.balign	2
 	.globl	C(ffi_closure_unix64_sse)
@@ -276,58 +275,54 @@ L(do_closure):
 	leaq	ffi_closure_FS+8(%rsp), %r9		/* Load argp */
 	call	C(ffi_closure_unix64_inner)
 
-	/* Deallocate stack frame early; return value is now in redzone.  */
-	addq	$ffi_closure_FS, %rsp
 L(UW10):
-	/* cfi_adjust_cfa_offset(-ffi_closure_FS) */
-
 	/* The first byte of the return value contains the FFI_TYPE.  */
 	cmpb	$UNIX64_RET_LAST, %al
 	movzbl	%al, %r10d
 	leaq	L(load_table)(%rip), %r11
 	ja	L(la)
 	leaq	(%r11, %r10, 8), %r10
-	leaq	ffi_closure_RED_RVALUE(%rsp), %rsi
+	leaq	ffi_closure_OFS_RVALUE(%rsp), %rsi
 	jmp	*%r10
 
 	.balign	8
 L(load_table):
 E(L(load_table), UNIX64_RET_VOID)
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_UINT8)
 	movzbl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_UINT16)
 	movzwl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_UINT32)
 	movl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_SINT8)
 	movsbl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_SINT16)
 	movswl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_SINT32)
 	movl	(%rsi), %eax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_INT64)
 	movq	(%rsi), %rax
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_XMM32)
 	movd	(%rsi), %xmm0
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_XMM64)
 	movq	(%rsi), %xmm0
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_X87)
 	fldt	(%rsi)
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_X87_2)
 	fldt	16(%rsi)
 	fldt	(%rsi)
-	ret
+	jmp	L(l4)
 E(L(load_table), UNIX64_RET_ST_XMM0_RAX)
 	movq	8(%rsi), %rax
 	jmp	L(l3)
@@ -341,10 +336,11 @@ E(L(load_table), UNIX64_RET_ST_RAX_RDX)
 	movq	8(%rsi), %rdx
 L(l2):
 	movq	(%rsi), %rax
-	ret
-	.balign	8
+	jmp	L(l4)
 L(l3):
 	movq	(%rsi), %xmm0
+L(l4):
+	addq	$ffi_closure_FS, %rsp
 	ret
 
 L(la):	call	PLT(C(abort))
